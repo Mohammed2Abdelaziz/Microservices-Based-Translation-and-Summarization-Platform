@@ -1,39 +1,93 @@
-name: Build and Run Docker Image
+name: CI/CD for Microservices with Database
 
 on:
   push:
     branches:
       - main
-    paths:
-      - 'EN2AR Translator/Dockerfile'
   pull_request:
     branches:
       - main
-    paths:
-      - 'EN2AR Translator/Dockerfile'
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-and-test:
+    name: Build and Test Microservices
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service: [auth, api-gateway, en2ar-translation, ar2en-translation, summarization]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Spin up Test Database
+        run: |
+          docker run -d --name test-db -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test-db -p 5432:5432 postgres:latest
+          sleep 10 # Wait for the DB to initialize
+
+      - name: Build and test ${{ matrix.service }}
+        run: |
+          docker build -t my-org/${{ matrix.service }}:latest ./${{ matrix.service }}
+          docker run --rm --network="host" -e DATABASE_URL=postgresql://test:test@localhost:5432/test-db my-org/${{ matrix.service }}:latest pytest
+
+      - name: Push image to DockerHub
+        run: |
+          docker tag my-org/${{ matrix.service }}:latest my-org/${{ matrix.service }}:${{ github.sha }}
+          docker push my-org/${{ matrix.service }}:${{ github.sha }}
+          docker push my-org/${{ matrix.service }}:latest
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v2
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          version: 'latest'
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: ./EN2AR Translator
-          tags: en2ar-service:latest
+      - name: Set up Kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG }}" > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
 
-      - name: Run Docker container
-        run: docker run -d -p 7000:7000 en2ar-service:latest
+      - name: Backup Database
+        run: |
+          echo "Backing up database..."
+          kubectl exec -i $(kubectl get pod -l app=database -o jsonpath='{.items[0].metadata.name}') -- pg_dump -U postgres > backup.sql
+
+      - name: Run Database Migrations
+        run: |
+          echo "Running migrations..."
+          docker run --rm --network="host" my-org/migration-service:latest migrate -database postgres://user:password@db-host:5432/database up
+
+      - name: Update Kubernetes manifests
+        run: |
+          sed -i "s|<image_tag>|${{ github.sha }}|g" ./k8s/manifests/*.yaml
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f ./k8s/manifests/
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/auth
+          kubectl rollout status deployment/api-gateway
+          kubectl rollout status deployment/en2ar-translation
+          kubectl rollout status deployment/ar2en-translation
+          kubectl rollout status deployment/summarization
